@@ -1,28 +1,34 @@
 """
 Fetch all products from Velossa Tech Design that have at least one of the
-specified option/customization tags, and export them to a CSV file and/or
-a Google Sheet.
+specified option/customization tags, and export them to a Google Sheet and
+optionally a local CSV file.
 
 Site:   Velossa Tech Design – https://www.velossatechdesign.com/
-Output: Velossa-Tagged-Products.csv  (always written)
-        Google Sheet                 (when EXPORT_TO_SHEETS = True)
+Output: Google Sheet  (when EXPORT_TO_SHEETS = true)
+        CSV file      (when EXPORT_CSV_FILE = true, local runs only)
 
 Uses the public Shopify storefront endpoint — no API credentials required.
 Only returns products that are currently published/active.
 
+Configuration (environment variables):
+  EXPORT_TO_SHEETS            true/false  — enable Google Sheets export (default: true)
+  EXPORT_CSV_FILE             true/false  — write a local CSV file (default: true)
+  SHEETS_SPREADSHEET_ID       Google Spreadsheet ID from the Sheet URL (…/d/<ID>/edit)
+  GOOGLE_SERVICE_ACCOUNT_JSON Full contents of your service-account.json (for Railway)
+  SHEETS_CREDENTIALS_FILE     Path to service-account.json (for local runs, default: service-account.json)
+
 Google Sheets setup (one-time):
   1. Create a Google Cloud project and enable the Google Sheets API.
   2. Create a Service Account and download its JSON key file.
-  3. Share your target Google Sheet with the service account e-mail
-     (editor access).
-  4. Set SHEETS_CREDENTIALS_FILE to the path of the JSON key file.
-  5. Set SHEETS_SPREADSHEET_ID to the ID from the Sheet's URL.
-  6. Set EXPORT_TO_SHEETS = True.
+  3. Share your target Google Sheet with the service account e-mail (editor access).
+  4. Set SHEETS_SPREADSHEET_ID and credential env vars as described above.
 """
 
 from __future__ import annotations
 
 import csv
+import json
+import os
 import sys
 import time
 
@@ -35,19 +41,18 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — driven by environment variables with sensible local defaults
 # ---------------------------------------------------------------------------
 
 STORE_URL  = "https://www.velossatechdesign.com"
 OUTPUT_CSV = "Velossa-Tagged-Products.csv"
 PAGE_SIZE  = 250   # Maximum allowed by the public endpoint
 
-# -- Google Sheets export (optional) ----------------------------------------
-# Set EXPORT_TO_SHEETS to True to write results to a Google Sheet.
-EXPORT_TO_SHEETS        = True
-SHEETS_CREDENTIALS_FILE = "service-account.json"   # Path to your service account JSON key
-SHEETS_SPREADSHEET_ID   = "1kmZ-a9shCMNbtdnJhZJvP4vo9hhHCHcXdzvUQgaG7n0"         # ID from the Sheet URL  (…/d/<ID>/edit)
-SHEETS_WORKSHEET_NAME   = "Products"               # Tab name inside the spreadsheet
+EXPORT_TO_SHEETS  = os.environ.get("EXPORT_TO_SHEETS",  "true").lower()  == "true"
+EXPORT_CSV_FILE   = os.environ.get("EXPORT_CSV_FILE",   "true").lower()  == "true"
+
+SHEETS_SPREADSHEET_ID   = os.environ.get("SHEETS_SPREADSHEET_ID",   "1kmZ-a9shCMNbtdnJhZJvP4vo9hhHCHcXdzvUQgaG7n0")
+SHEETS_CREDENTIALS_FILE = os.environ.get("SHEETS_CREDENTIALS_FILE", "service-account.json")
 
 TARGET_TAGS: set[str] = {
     "flarecolor",
@@ -239,15 +244,26 @@ def export_to_sheets(products: list[dict]) -> None:
         sys.exit(1)
 
     if not SHEETS_SPREADSHEET_ID:
-        print("Error: SHEETS_SPREADSHEET_ID is not set in the configuration.")
+        print("Error: SHEETS_SPREADSHEET_ID env var is not set.")
         sys.exit(1)
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    print(f"Authenticating with service account: {SHEETS_CREDENTIALS_FILE} ...")
-    creds  = Credentials.from_service_account_file(SHEETS_CREDENTIALS_FILE, scopes=scopes)
+    raw_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if raw_json:
+        print("Authenticating with service account from GOOGLE_SERVICE_ACCOUNT_JSON env var ...")
+        creds = Credentials.from_service_account_info(json.loads(raw_json), scopes=scopes)
+    elif os.path.exists(SHEETS_CREDENTIALS_FILE):
+        print(f"Authenticating with service account from {SHEETS_CREDENTIALS_FILE} ...")
+        creds = Credentials.from_service_account_file(SHEETS_CREDENTIALS_FILE, scopes=scopes)
+    else:
+        print(
+            "Error: No Google credentials found.\n"
+            "  Set the GOOGLE_SERVICE_ACCOUNT_JSON env var (Railway / CI)\n"
+            f"  or place a service account key at: {SHEETS_CREDENTIALS_FILE}"
+        )
+        sys.exit(1)
+
     client = gspread.authorize(creds)
 
     spreadsheet = client.open_by_key(SHEETS_SPREADSHEET_ID)
@@ -290,7 +306,8 @@ def main() -> None:
         print(f"  {tag:<20} {count}")
 
     print()
-    export_csv(matched)
+    if EXPORT_CSV_FILE:
+        export_csv(matched)
 
     if EXPORT_TO_SHEETS:
         export_to_sheets(matched)
