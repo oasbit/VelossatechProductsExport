@@ -153,15 +153,11 @@ To add or remove tags, edit the `TARGET_TAGS` set in the script.
 
 ## Railway Deployment
 
-The `railway.toml` configures Railway to:
+The project includes a `Dockerfile` that bakes Python, Playwright, and the Chromium browser into the image. Railway automatically detects and uses it.
 
-1. Install Python dependencies and the Playwright Chromium browser during build.
-2. Run the script daily at 08:00 UTC.
+The `railway.toml` schedules the script to run daily at 08:00 UTC:
 
 ```toml
-[build]
-buildCommand = "pip install -r requirements.txt && playwright install chromium --with-deps"
-
 [deploy]
 startCommand = "python3 fetch_velossa_tagged_products.py"
 cronSchedule = "0 8 * * *"
