@@ -14,6 +14,12 @@ Data source (auto-selected):
   Storefront — public /products.json fallback (no credentials needed). Returns
                only published products and caps variants per product.
 
+Infinite Options scraping:
+  When SCRAPE_INFINITE_OPTIONS=true, a headless Chromium browser renders each
+  product page and extracts the option groups injected by the Infinite Options
+  app. The results are merged into the export as IO Option N Name/Values columns.
+  Requires: playwright  (pip install playwright && playwright install chromium)
+
 Configuration (environment variables):
   SHOPIFY_ADMIN_TOKEN         Shopify Admin API access token (from .velossa_admin_token
                               or set manually). Unlocks full variant data.
@@ -24,6 +30,8 @@ Configuration (environment variables):
   SHEETS_SPREADSHEET_ID       Google Spreadsheet ID from the Sheet URL (…/d/<ID>/edit)
   GOOGLE_SERVICE_ACCOUNT_JSON Full contents of your service-account.json (for Railway)
   SHEETS_CREDENTIALS_FILE     Path to service-account.json (for local runs, default: service-account.json)
+  SCRAPE_INFINITE_OPTIONS     true/false  — scrape Infinite Options from product pages (default: true)
+  IO_CONCURRENCY              Number of parallel browser pages for scraping (default: 5)
 
 Google Sheets setup (one-time):
   1. Create a Google Cloud project and enable the Google Sheets API.
@@ -34,6 +42,7 @@ Google Sheets setup (one-time):
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import os
@@ -61,6 +70,11 @@ EXPORT_CSV_FILE   = os.environ.get("EXPORT_CSV_FILE",   "true").lower()  == "tru
 
 SHEETS_SPREADSHEET_ID   = os.environ.get("SHEETS_SPREADSHEET_ID",   "1kmZ-a9shCMNbtdnJhZJvP4vo9hhHCHcXdzvUQgaG7n0")
 SHEETS_CREDENTIALS_FILE = os.environ.get("SHEETS_CREDENTIALS_FILE", "service-account.json")
+
+# -- Infinite Options scraping -----------------------------------------------
+SCRAPE_INFINITE_OPTIONS = os.environ.get("SCRAPE_INFINITE_OPTIONS", "true").lower() == "true"
+IO_CONCURRENCY          = int(os.environ.get("IO_CONCURRENCY", "5"))
+MAX_IO_OPTIONS          = 5   # Maximum number of option groups to export as columns
 
 # -- Shopify Admin API (optional) -------------------------------------------
 # When set, uses the Admin API to get ALL variants and ALL products (including
@@ -239,13 +253,112 @@ def fetch_all_products_admin() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Infinite Options scraping (headless Chromium via Playwright)
+# ---------------------------------------------------------------------------
+
+async def _extract_io_options(page) -> list[dict]:
+    """Extract Infinite Options groups from an already-loaded page."""
+    groups = await page.query_selector_all('#infiniteoptions-container [role="group"]')
+    options: list[dict] = []
+    for group in groups:
+        first_input = await group.query_selector('input[type="radio"]')
+        if not first_input:
+            continue
+        name_attr = await first_input.get_attribute("name") or ""
+        option_name = name_attr[name_attr.find("[") + 1 : name_attr.find("]")]
+        if not option_name:
+            continue
+        inputs = await group.query_selector_all('input[type="radio"]')
+        values = [v for v in [await i.get_attribute("value") for i in inputs] if v]
+        if values:
+            options.append({"name": option_name, "values": values})
+    return options
+
+
+ALLOWED_SCRAPE_DOMAINS = [
+    "velossatechdesign.com",
+    "cdn.shopify.com",
+    "shoppad",
+    "optionify",
+    "customizery",
+    "shopifycloud",
+]
+
+
+async def _scrape_all_async(handles: list[str]) -> dict[str, list[dict]]:
+    """
+    Launch a headless Chromium browser and concurrently scrape Infinite Options
+    from each product page. Returns {handle: [{"name": ..., "values": [...]}, ...]}.
+
+    Only allows requests to the store, Shopify CDN, and ShopPad domains — this
+    prevents analytics/ad scripts from blocking DOMContentLoaded while still
+    allowing the Infinite Options widget to load its data from ShopPad's servers.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print(
+            "Error: playwright is not installed.\n"
+            "Run: pip install playwright && playwright install chromium"
+        )
+        sys.exit(1)
+
+    results: dict[str, list[dict]] = {}
+    sem = asyncio.Semaphore(IO_CONCURRENCY)
+    completed = 0
+
+    async def smart_route(route) -> None:
+        if any(d in route.request.url for d in ALLOWED_SCRAPE_DOMAINS):
+            await route.continue_()
+        else:
+            await route.abort()
+
+    async def scrape_one(browser, handle: str) -> None:
+        nonlocal completed
+        async with sem:
+            page = await browser.new_page()
+            await page.route("**/*", smart_route)
+            try:
+                url = f"{STORE_URL}/products/{handle}"
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_selector(
+                    '#infiniteoptions-container input[type="radio"]',
+                    timeout=12000,
+                )
+                results[handle] = await _extract_io_options(page)
+            except Exception:
+                results[handle] = []
+            finally:
+                completed += 1
+                print(f"  [{completed}/{len(handles)}] {handle}", flush=True)
+                await page.close()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        await asyncio.gather(*[scrape_one(browser, h) for h in handles])
+        await browser.close()
+
+    return results
+
+
+def fetch_infinite_options(handles: list[str]) -> dict[str, list[dict]]:
+    """Synchronous wrapper around the async Playwright scraper."""
+    print(f"\nScraping Infinite Options from {len(handles)} product page(s) ...")
+    return asyncio.run(_scrape_all_async(handles))
+
+
+# ---------------------------------------------------------------------------
 # Filter and shape
 # ---------------------------------------------------------------------------
 
-def filter_and_shape(raw_products: list[dict]) -> list[dict]:
+def filter_and_shape(
+    raw_products: list[dict],
+    io_options: dict[str, list[dict]] | None = None,
+) -> list[dict]:
     """
     Keep only products that have at least one TARGET_TAG.
     Returns one flat dict per variant (one row per variant in the output).
+    io_options — optional dict {handle: [{name, values}, ...]} from the scraper.
     """
     results: list[dict] = []
 
@@ -261,15 +374,25 @@ def filter_and_shape(raw_products: list[dict]) -> list[dict]:
         if not matched:
             continue
 
+        handle = p["handle"]
+
+        # Build Infinite Options columns (up to MAX_IO_OPTIONS groups)
+        io_cols: dict[str, str] = {}
+        if io_options is not None:
+            for i, opt in enumerate(io_options.get(handle, [])[:MAX_IO_OPTIONS], start=1):
+                io_cols[f"IO Option {i} Name"]   = opt["name"]
+                io_cols[f"IO Option {i} Values"] = ", ".join(opt["values"])
+
         product_base = {
             "Product ID":    p["id"],
             "Title":         p["title"],
-            "Handle":        p["handle"],
+            "Handle":        handle,
             "Product Type":  p.get("product_type", ""),
             "Matched Tags":  ", ".join(matched),
-            "Product URL":   f"{STORE_URL}/products/{p['handle']}",
+            "Product URL":   f"{STORE_URL}/products/{handle}",
             "Created At":    p.get("created_at", ""),
             "Updated At":    p.get("updated_at", ""),
+            **io_cols,
         }
 
         for v in p.get("variants", []):
@@ -290,6 +413,8 @@ def filter_and_shape(raw_products: list[dict]) -> list[dict]:
 # Export helpers
 # ---------------------------------------------------------------------------
 
+_IO_COLUMNS = [col for i in range(1, MAX_IO_OPTIONS + 1) for col in (f"IO Option {i} Name", f"IO Option {i} Values")]
+
 FIELDNAMES = [
     "Product ID",
     "Title",
@@ -297,6 +422,7 @@ FIELDNAMES = [
     "Product Type",
     "Matched Tags",
     "Product URL",
+    *_IO_COLUMNS,
     "Variant ID",
     "Variant Title",
     "Price",
@@ -310,9 +436,9 @@ FIELDNAMES = [
 
 def export_csv(products: list[dict]) -> None:
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(products)
+        writer.writerows({f: p.get(f, "") for f in FIELDNAMES} for p in products)
 
     print(f"Exported {len(products)} product(s) → {OUTPUT_CSV}")
 
@@ -363,8 +489,8 @@ def export_to_sheets(products: list[dict]) -> None:
     spreadsheet = client.open_by_key(SHEETS_SPREADSHEET_ID)
     worksheet   = spreadsheet.get_worksheet(0)
 
-    # Build rows: header first, then one row per product
-    rows = [FIELDNAMES] + [[str(p[field]) for field in FIELDNAMES] for p in products]
+    # Build rows: header first, then one row per product (missing keys default to "")
+    rows = [FIELDNAMES] + [[str(p.get(field, "")) for field in FIELDNAMES] for p in products]
 
     worksheet.clear()
     worksheet.update(rows, value_input_option=ValueInputOption.user_entered)
@@ -389,7 +515,19 @@ def main() -> None:
         raw = fetch_all_products()
         print(f"\nTotal products (storefront) : {len(raw)}")
 
-    matched = filter_and_shape(raw)
+    # Scrape Infinite Options option groups from each matching product page
+    io_options: dict[str, list[dict]] | None = None
+    if SCRAPE_INFINITE_OPTIONS:
+        handles = list({p["handle"] for p in raw if any(
+            t.strip().lower() in TARGET_TAGS
+            for t in (p.get("tags", []) if not isinstance(p.get("tags"), str)
+                      else p["tags"].split(","))
+        )})
+        io_options = fetch_infinite_options(handles)
+        with_options = sum(1 for v in io_options.values() if v)
+        print(f"  {with_options}/{len(handles)} products have Infinite Options")
+
+    matched = filter_and_shape(raw, io_options)
 
     if not matched:
         print("No products found matching the specified tags.")
@@ -405,7 +543,7 @@ def main() -> None:
             for tag in row["Matched Tags"].split(", "):
                 tag_products.setdefault(tag, set()).add(pid)
 
-    print(f"Matching products       : {len(seen)}")
+    print(f"\nMatching products       : {len(seen)}")
     print(f"Total variant rows      : {len(matched)}")
     print("\nBreakdown by matched tag:")
     for tag, prods in sorted(tag_products.items(), key=lambda x: -len(x[1])):

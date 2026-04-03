@@ -1,3 +1,6 @@
+[build]
+buildCommand = "pip install -r requirements.txt && playwright install chromium --with-deps"
+
 [deploy]
-startCommand   = "python3 fetch_velossa_tagged_products.py"
-cronSchedule   = "0 8 * * *"
+startCommand = "python3 fetch_velossa_tagged_products.py"
+cronSchedule = "0 8 * * *"
