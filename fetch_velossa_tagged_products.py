@@ -166,7 +166,7 @@ def fetch_all_products() -> list[dict]:
 def filter_and_shape(raw_products: list[dict]) -> list[dict]:
     """
     Keep only products that have at least one TARGET_TAG.
-    Returns a list of flat dicts ready for CSV export.
+    Returns one flat dict per variant (one row per variant in the output).
     """
     results: list[dict] = []
 
@@ -182,17 +182,27 @@ def filter_and_shape(raw_products: list[dict]) -> list[dict]:
         if not matched:
             continue
 
-        results.append({
-            "Product ID":      p["id"],
-            "Title":           p["title"],
-            "Handle":          p["handle"],
-            "Product Type":    p.get("product_type", ""),
-            "Variants Count":  len(p.get("variants", [])),
-            "Matched Tags":    ", ".join(matched),
-            "Product URL":     f"{STORE_URL}/products/{p['handle']}",
-            "Created At":      p.get("created_at", ""),
-            "Updated At":      p.get("updated_at", ""),
-        })
+        product_base = {
+            "Product ID":    p["id"],
+            "Title":         p["title"],
+            "Handle":        p["handle"],
+            "Product Type":  p.get("product_type", ""),
+            "Matched Tags":  ", ".join(matched),
+            "Product URL":   f"{STORE_URL}/products/{p['handle']}",
+            "Created At":    p.get("created_at", ""),
+            "Updated At":    p.get("updated_at", ""),
+        }
+
+        for v in p.get("variants", []):
+            results.append({
+                **product_base,
+                "Variant ID":       v["id"],
+                "Variant Title":    v.get("title", ""),
+                "Price":            v.get("price", ""),
+                "Compare At Price": v.get("compare_at_price") or "",
+                "SKU":              v.get("sku") or "",
+                "Available":        v.get("available", ""),
+            })
 
     return results
 
@@ -206,9 +216,14 @@ FIELDNAMES = [
     "Title",
     "Handle",
     "Product Type",
-    "Variants Count",
     "Matched Tags",
     "Product URL",
+    "Variant ID",
+    "Variant Title",
+    "Price",
+    "Compare At Price",
+    "SKU",
+    "Available",
     "Created At",
     "Updated At",
 ]
@@ -294,16 +309,21 @@ def main() -> None:
         print("No products found matching the specified tags.")
         return
 
-    # Per-tag breakdown
-    tag_counts: dict[str, int] = {}
-    for p in matched:
-        for tag in p["Matched Tags"].split(", "):
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    # Per-tag breakdown — count unique products (not variant rows)
+    tag_products: dict[str, set] = {}
+    seen: set = set()
+    for row in matched:
+        pid = row["Product ID"]
+        if pid not in seen:
+            seen.add(pid)
+            for tag in row["Matched Tags"].split(", "):
+                tag_products.setdefault(tag, set()).add(pid)
 
-    print(f"Matching products       : {len(matched)}")
+    print(f"Matching products       : {len(seen)}")
+    print(f"Total variant rows      : {len(matched)}")
     print("\nBreakdown by matched tag:")
-    for tag, count in sorted(tag_counts.items(), key=lambda x: -x[1]):
-        print(f"  {tag:<20} {count}")
+    for tag, prods in sorted(tag_products.items(), key=lambda x: -len(x[1])):
+        print(f"  {tag:<20} {len(prods)}")
 
     print()
     if EXPORT_CSV_FILE:
