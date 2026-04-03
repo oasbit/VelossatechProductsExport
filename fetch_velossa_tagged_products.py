@@ -7,10 +7,18 @@ Site:   Velossa Tech Design – https://www.velossatechdesign.com/
 Output: Google Sheet  (when EXPORT_TO_SHEETS = true)
         CSV file      (when EXPORT_CSV_FILE = true, local runs only)
 
-Uses the public Shopify storefront endpoint — no API credentials required.
-Only returns products that are currently published/active.
+Data source (auto-selected):
+  Admin API  — used when SHOPIFY_ADMIN_TOKEN is set. Returns ALL products and
+               ALL variants including unpublished ones and products with 100+
+               variants. Recommended for accurate data.
+  Storefront — public /products.json fallback (no credentials needed). Returns
+               only published products and caps variants per product.
 
 Configuration (environment variables):
+  SHOPIFY_ADMIN_TOKEN         Shopify Admin API access token (from .velossa_admin_token
+                              or set manually). Unlocks full variant data.
+  SHOPIFY_STORE               Myshopify domain, e.g. velossatech.myshopify.com
+                              (only needed with SHOPIFY_ADMIN_TOKEN)
   EXPORT_TO_SHEETS            true/false  — enable Google Sheets export (default: true)
   EXPORT_CSV_FILE             true/false  — write a local CSV file (default: true)
   SHEETS_SPREADSHEET_ID       Google Spreadsheet ID from the Sheet URL (…/d/<ID>/edit)
@@ -46,13 +54,26 @@ except ImportError:
 
 STORE_URL  = "https://www.velossatechdesign.com"
 OUTPUT_CSV = "Velossa-Tagged-Products.csv"
-PAGE_SIZE  = 250   # Maximum allowed by the public endpoint
+PAGE_SIZE  = 250   # Maximum allowed by both endpoints
 
 EXPORT_TO_SHEETS  = os.environ.get("EXPORT_TO_SHEETS",  "true").lower()  == "true"
 EXPORT_CSV_FILE   = os.environ.get("EXPORT_CSV_FILE",   "true").lower()  == "true"
 
 SHEETS_SPREADSHEET_ID   = os.environ.get("SHEETS_SPREADSHEET_ID",   "1kmZ-a9shCMNbtdnJhZJvP4vo9hhHCHcXdzvUQgaG7n0")
 SHEETS_CREDENTIALS_FILE = os.environ.get("SHEETS_CREDENTIALS_FILE", "service-account.json")
+
+# -- Shopify Admin API (optional) -------------------------------------------
+# When set, uses the Admin API to get ALL variants and ALL products (including
+# unpublished). Token is read from the env var or from the local token file.
+_token_file = os.environ.get("SHOPIFY_TOKEN_FILE", ".velossa_admin_token")
+_token_from_file = ""
+if os.path.exists(_token_file):
+    with open(_token_file) as _f:
+        _token_from_file = _f.read().strip()
+
+SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", _token_from_file)
+SHOPIFY_STORE       = os.environ.get("SHOPIFY_STORE", "velossatech.myshopify.com")
+SHOPIFY_API_VERSION = "2026-01"
 
 TARGET_TAGS: set[str] = {
     "flarecolor",
@@ -155,6 +176,64 @@ def fetch_all_products() -> list[dict]:
 
         page += 1
         time.sleep(0.3)
+
+    return all_products
+
+
+def fetch_all_products_admin() -> list[dict]:
+    """
+    Pages through the Shopify Admin API /products.json using cursor-based
+    pagination (Link header). Returns all products with complete variant data.
+    Requires SHOPIFY_ADMIN_TOKEN to be set.
+    """
+    all_products: list[dict] = []
+    url    = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/products.json"
+    params = {"limit": PAGE_SIZE, "status": "active"}
+
+    print(f"Fetching all products via Admin API ({SHOPIFY_STORE}) ...")
+
+    while url:
+        for attempt in range(7):
+            try:
+                resp = SESSION.get(url, params=params, timeout=15)
+            except requests.exceptions.ConnectionError as exc:
+                wait = 2 ** attempt
+                print(f"  Connection error ({exc}) — retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+
+            if resp.status_code == 429:
+                wait = float(resp.headers.get("Retry-After", 2 ** attempt))
+                print(f"  Rate limited — waiting {wait:.1f}s before retry...")
+                time.sleep(wait)
+                continue
+
+            if resp.status_code in (502, 503, 504):
+                wait = 2 ** attempt
+                print(f"  HTTP {resp.status_code} — retrying in {wait}s (attempt {attempt + 1}/7)...")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            break
+
+        products: list[dict] = resp.json().get("products", [])
+        all_products.extend(products)
+        print(f"  Fetched {len(products)} products (total: {len(all_products)})")
+
+        # Follow the next-page cursor from the Link header
+        link_header = resp.headers.get("Link", "")
+        next_url = None
+        for part in link_header.split(","):
+            part = part.strip()
+            if 'rel="next"' in part:
+                next_url = part.split(";")[0].strip().strip("<>")
+                break
+
+        url    = next_url
+        params = {}   # URL already contains all params when paginating
+        if url:
+            time.sleep(0.3)
 
     return all_products
 
@@ -300,8 +379,15 @@ def export_to_sheets(products: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    raw = fetch_all_products()
-    print(f"\nTotal products on store : {len(raw)}")
+    if SHOPIFY_ADMIN_TOKEN:
+        SESSION.headers.update({"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN})
+        raw = fetch_all_products_admin()
+        print(f"\nTotal products (Admin API) : {len(raw)}")
+    else:
+        print("No SHOPIFY_ADMIN_TOKEN found — falling back to public storefront API.")
+        print("Note: variant data may be incomplete for products with many variants.")
+        raw = fetch_all_products()
+        print(f"\nTotal products (storefront) : {len(raw)}")
 
     matched = filter_and_shape(raw)
 
