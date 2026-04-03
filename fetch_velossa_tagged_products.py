@@ -257,22 +257,48 @@ def fetch_all_products_admin() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 async def _extract_io_options(page) -> list[dict]:
-    """Extract Infinite Options groups from an already-loaded page."""
-    groups = await page.query_selector_all('#infiniteoptions-container [role="group"]')
-    options: list[dict] = []
-    for group in groups:
-        first_input = await group.query_selector('input[type="radio"]')
-        if not first_input:
-            continue
-        name_attr = await first_input.get_attribute("name") or ""
-        option_name = name_attr[name_attr.find("[") + 1 : name_attr.find("]")]
-        if not option_name:
-            continue
-        inputs = await group.query_selector_all('input[type="radio"]')
-        values = [v for v in [await i.get_attribute("value") for i in inputs] if v]
-        if values:
-            options.append({"name": option_name, "values": values})
-    return options
+    """
+    Extract Infinite Options groups from an already-loaded page.
+    Handles both radio-swatch groups (role="group") and select dropdown groups,
+    returning them in document order.
+    """
+    return await page.evaluate("""() => {
+        const container = document.getElementById('infiniteoptions-container');
+        if (!container) return [];
+
+        const results = [];
+
+        // Radio-swatch option groups
+        container.querySelectorAll('[role="group"]').forEach(group => {
+            const first = group.querySelector('input[type="radio"]');
+            if (!first) return;
+            const raw = first.getAttribute('name') || '';
+            const name = raw.slice(raw.indexOf('[') + 1, raw.indexOf(']'));
+            if (!name) return;
+            const values = [...group.querySelectorAll('input[type="radio"]')]
+                .map(i => i.getAttribute('value'))
+                .filter(v => v);
+            if (values.length)
+                results.push({ name, values, top: group.getBoundingClientRect().top });
+        });
+
+        // Select dropdown option groups
+        container.querySelectorAll('select[name^="properties["]').forEach(sel => {
+            const raw = sel.getAttribute('name') || '';
+            const name = raw.slice(raw.indexOf('[') + 1, raw.indexOf(']'));
+            if (!name) return;
+            const values = [...sel.querySelectorAll('option:not([disabled])')]
+                .map(o => o.getAttribute('value'))
+                .filter(v => v);
+            if (values.length)
+                results.push({ name, values, top: sel.getBoundingClientRect().top });
+        });
+
+        // Return in document (top-to-bottom) order, without the sort key
+        results.sort((a, b) => a.top - b.top);
+        return results.map(({ name, values }) => ({ name, values }));
+    }""")
+
 
 
 ALLOWED_SCRAPE_DOMAINS = [
@@ -322,7 +348,8 @@ async def _scrape_all_async(handles: list[str]) -> dict[str, list[dict]]:
                 url = f"{STORE_URL}/products/{handle}"
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_selector(
-                    '#infiniteoptions-container input[type="radio"]',
+                    '#infiniteoptions-container input[type="radio"], '
+                    '#infiniteoptions-container select[name^="properties["]',
                     timeout=12000,
                 )
                 results[handle] = await _extract_io_options(page)
