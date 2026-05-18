@@ -125,6 +125,8 @@ IO_CONCURRENCY=5                  # Parallel browser pages (increase to speed up
 | Product Type | Shopify product type |
 | Matched Tags | Customization tags found on the product |
 | Product URL | Direct link to the product page |
+| Description | Product description as plain text (HTML stripped from `body_html`) |
+| Image URL | Image for this variant when available; otherwise the product’s featured / first image |
 | IO Option 1 Name | First Infinite Options group name (e.g. "Body/Snorkel Color") |
 | IO Option 1 Values | Comma-separated list of values for option group 1 |
 | IO Option 2 Name | Second Infinite Options group name |

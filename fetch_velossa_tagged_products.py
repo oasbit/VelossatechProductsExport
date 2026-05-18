@@ -44,8 +44,10 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import html
 import json
 import os
+import re
 import sys
 import time
 
@@ -378,6 +380,58 @@ def fetch_infinite_options(handles: list[str]) -> dict[str, list[dict]]:
 # Filter and shape
 # ---------------------------------------------------------------------------
 
+def _plain_text_from_html(body: str) -> str:
+    """Strip HTML tags for a readable Description column in Sheets/CSV."""
+    if not body:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", body)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_image_url(src: str | None) -> str:
+    if not src:
+        return ""
+    s = str(src).strip()
+    if s.startswith("//"):
+        return "https:" + s
+    return s
+
+
+def _image_url_for_variant(product: dict, variant: dict) -> str:
+    """
+    Prefer the variant's own image when Shopify provides one; otherwise the
+    product's featured / first image. Works with Admin API and storefront JSON.
+    """
+    v = variant
+    p = product
+
+    fi = v.get("featured_image")
+    if isinstance(fi, dict) and fi.get("src"):
+        return _normalize_image_url(fi["src"])
+
+    vid = v.get("image_id")
+    if vid:
+        for img in p.get("images") or []:
+            if isinstance(img, dict) and img.get("id") == vid:
+                return _normalize_image_url(img.get("src"))
+
+    feat = p.get("image")
+    if isinstance(feat, dict) and feat.get("src"):
+        return _normalize_image_url(feat["src"])
+
+    imgs = p.get("images") or []
+    if imgs and isinstance(imgs[0], dict):
+        return _normalize_image_url(imgs[0].get("src"))
+
+    return ""
+
+
+def _product_description(product: dict) -> str:
+    raw = product.get("body_html") or product.get("body") or ""
+    return _plain_text_from_html(raw)
+
+
 def filter_and_shape(
     raw_products: list[dict],
     io_options: dict[str, list[dict]] | None = None,
@@ -417,6 +471,7 @@ def filter_and_shape(
             "Product Type":  p.get("product_type", ""),
             "Matched Tags":  ", ".join(matched),
             "Product URL":   f"{STORE_URL}/products/{handle}",
+            "Description":   _product_description(p),
             "Created At":    p.get("created_at", ""),
             "Updated At":    p.get("updated_at", ""),
             **io_cols,
@@ -425,6 +480,7 @@ def filter_and_shape(
         for v in p.get("variants", []):
             results.append({
                 **product_base,
+                "Image URL":        _image_url_for_variant(p, v),
                 "Variant ID":       v["id"],
                 "Variant Title":    v.get("title", ""),
                 "Price":            v.get("price", ""),
@@ -449,6 +505,8 @@ FIELDNAMES = [
     "Product Type",
     "Matched Tags",
     "Product URL",
+    "Description",
+    "Image URL",
     *_IO_COLUMNS,
     "Variant ID",
     "Variant Title",
