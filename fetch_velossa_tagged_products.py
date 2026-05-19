@@ -76,6 +76,11 @@ SHEETS_CREDENTIALS_FILE = os.environ.get("SHEETS_CREDENTIALS_FILE", "service-acc
 # -- Infinite Options scraping -----------------------------------------------
 SCRAPE_INFINITE_OPTIONS = os.environ.get("SCRAPE_INFINITE_OPTIONS", "true").lower() == "true"
 IO_CONCURRENCY          = int(os.environ.get("IO_CONCURRENCY", "5"))
+IO_WAIT_TIMEOUT_MS      = int(os.environ.get("IO_WAIT_TIMEOUT_MS", "30000"))
+IO_SCRAPE_RETRIES       = int(os.environ.get("IO_SCRAPE_RETRIES", "3"))
+IO_POLL_INTERVAL_MS     = int(os.environ.get("IO_POLL_INTERVAL_MS", "500"))
+_io_goto_wait            = os.environ.get("IO_GOTO_WAIT", "load").lower()
+IO_GOTO_WAIT            = _io_goto_wait if _io_goto_wait in ("load", "domcontentloaded", "networkidle") else "load"
 MAX_IO_OPTIONS          = 5   # Maximum number of option groups to export as columns
 MAX_PRODUCT_IMAGES      = int(os.environ.get("MAX_PRODUCT_IMAGES", "50"))  # Cap image columns per product
 
@@ -304,14 +309,115 @@ async def _extract_io_options(page) -> list[dict]:
 
 
 
-ALLOWED_SCRAPE_DOMAINS = [
-    "velossatechdesign.com",
-    "cdn.shopify.com",
-    "shoppad",
-    "optionify",
-    "customizery",
-    "shopifycloud",
-]
+# Block analytics/ads only — Infinite Options may load scripts from various CDNs.
+BLOCKED_SCRAPE_DOMAINS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googleadservices.com",
+    "pagead2.googlesyndication.com",
+    "doubleclick.net",
+    "facebook.net",
+    "facebook.com",
+    "connect.facebook.net",
+    "hotjar.com",
+    "clarity.ms",
+    "chimpstatic.com",
+    "judge.me",
+    "aaawebstore.com",
+    "newrelic.com",
+    "nr-data.net",
+    "bing.com",
+    "pinterest.com",
+    "tiktok.com",
+    "twitter.com",
+    "snapchat.com",
+)
+
+
+async def _io_control_count(page) -> int:
+    """Count radio values + select options currently in the IO container."""
+    return await page.evaluate("""() => {
+        const c = document.getElementById('infiniteoptions-container');
+        if (!c) return 0;
+        let n = 0;
+        c.querySelectorAll('input[type="radio"]').forEach(i => { if (i.value) n++; });
+        c.querySelectorAll('select[name^="properties["] option:not([disabled])').forEach(o => {
+            if (o.value) n++;
+        });
+        return n;
+    }""")
+
+
+async def _wait_for_io_ready(page) -> bool:
+    """
+    Wait until Infinite Options has injected option controls into the container.
+    Polls until controls appear and stay stable (widget finished rendering).
+    """
+    container_timeout = min(15_000, IO_WAIT_TIMEOUT_MS)
+    try:
+        await page.wait_for_selector(
+            "#infiniteoptions-container",
+            state="attached",
+            timeout=container_timeout,
+        )
+    except Exception:
+        return False
+
+    try:
+        await page.wait_for_function(
+            """() => {
+                const c = document.getElementById('infiniteoptions-container');
+                if (!c) return false;
+                if (c.querySelector('input[type="radio"][value]')) return true;
+                const opts = c.querySelectorAll(
+                    'select[name^="properties["] option:not([disabled])'
+                );
+                for (const o of opts) if (o.value) return true;
+                return false;
+            }""",
+            timeout=IO_WAIT_TIMEOUT_MS,
+        )
+        return True
+    except Exception:
+        pass
+
+    # Fallback: poll until controls appear and count is stable for two intervals
+    poll_s = IO_POLL_INTERVAL_MS / 1000
+    deadline = time.monotonic() + (IO_WAIT_TIMEOUT_MS / 1000)
+    best = 0
+    stable_rounds = 0
+    while time.monotonic() < deadline:
+        count = await _io_control_count(page)
+        if count > 0:
+            if count == best:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    return True
+            else:
+                best = count
+                stable_rounds = 0
+        else:
+            stable_rounds = 0
+        await asyncio.sleep(poll_s)
+
+    return await _io_control_count(page) > 0
+
+
+async def _scrape_io_page(page) -> list[dict]:
+    """Wait for IO widget, then extract; brief extra pause if DOM still growing."""
+    if not await _wait_for_io_ready(page):
+        return []
+
+    prev = -1
+    for _ in range(6):
+        opts = await _extract_io_options(page)
+        count = await _io_control_count(page)
+        if opts and count == prev:
+            return opts
+        prev = count
+        await asyncio.sleep(IO_POLL_INTERVAL_MS / 1000)
+
+    return await _extract_io_options(page)
 
 
 async def _scrape_all_async(handles: list[str]) -> dict[str, list[dict]]:
@@ -319,9 +425,8 @@ async def _scrape_all_async(handles: list[str]) -> dict[str, list[dict]]:
     Launch a headless Chromium browser and concurrently scrape Infinite Options
     from each product page. Returns {handle: [{"name": ..., "values": [...]}, ...]}.
 
-    Only allows requests to the store, Shopify CDN, and ShopPad domains — this
-    prevents analytics/ad scripts from blocking DOMContentLoaded while still
-    allowing the Infinite Options widget to load its data from ShopPad's servers.
+    Uses a blocklist for analytics (not a strict allowlist) so ShopPad / IO scripts
+    on any CDN can load. Retries pages where options were not ready in time.
     """
     try:
         from playwright.async_api import async_playwright
@@ -335,37 +440,68 @@ async def _scrape_all_async(handles: list[str]) -> dict[str, list[dict]]:
     results: dict[str, list[dict]] = {}
     sem = asyncio.Semaphore(IO_CONCURRENCY)
     completed = 0
+    progress_lock = asyncio.Lock()
 
-    async def smart_route(route) -> None:
-        if any(d in route.request.url for d in ALLOWED_SCRAPE_DOMAINS):
-            await route.continue_()
-        else:
+    async def blocklist_route(route) -> None:
+        url = route.request.url
+        if any(d in url for d in BLOCKED_SCRAPE_DOMAINS):
             await route.abort()
+        else:
+            await route.continue_()
 
-    async def scrape_one(browser, handle: str) -> None:
+    async def scrape_one(browser, handle: str, *, pass_label: str = "") -> None:
         nonlocal completed
         async with sem:
-            page = await browser.new_page()
-            await page.route("**/*", smart_route)
-            try:
-                url = f"{STORE_URL}/products/{handle}"
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_selector(
-                    '#infiniteoptions-container input[type="radio"], '
-                    '#infiniteoptions-container select[name^="properties["]',
-                    timeout=12000,
-                )
-                results[handle] = await _extract_io_options(page)
-            except Exception:
-                results[handle] = []
-            finally:
+            opts: list[dict] = []
+            attempts = max(1, IO_SCRAPE_RETRIES)
+
+            for attempt in range(1, attempts + 1):
+                page = await browser.new_page()
+                await page.route("**/*", blocklist_route)
+                try:
+                    url = f"{STORE_URL}/products/{handle}"
+                    await page.goto(
+                        url,
+                        wait_until=IO_GOTO_WAIT,
+                        timeout=45_000,
+                    )
+                    opts = await _scrape_io_page(page)
+                    if opts:
+                        break
+                    if attempt < attempts:
+                        await asyncio.sleep(attempt * 1.5)
+                except Exception:
+                    if attempt < attempts:
+                        await asyncio.sleep(attempt * 1.5)
+                finally:
+                    await page.close()
+
+            results[handle] = opts
+            async with progress_lock:
                 completed += 1
-                print(f"  [{completed}/{len(handles)}] {handle}", flush=True)
-                await page.close()
+                n = completed
+            status = f"{len(opts)} group(s)" if opts else "no options"
+            suffix = f" [{pass_label}]" if pass_label else ""
+            tries = f", attempt {attempt}/{attempts}" if attempts > 1 and not opts else ""
+            print(f"  [{n}/{len(handles)}] {handle} — {status}{tries}{suffix}", flush=True)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         await asyncio.gather(*[scrape_one(browser, h) for h in handles])
+
+        # Second pass: slower retry for products that still have empty IO columns
+        empty = [h for h in handles if not results.get(h)]
+        if empty:
+            print(f"\n  Retrying {len(empty)} product(s) with empty options (slower pass) ...")
+            retry_sem = asyncio.Semaphore(max(1, min(2, IO_CONCURRENCY)))
+            old_sem = sem
+            sem = retry_sem
+            completed = len(handles) - len(empty)
+            await asyncio.gather(
+                *[scrape_one(browser, h, pass_label="retry") for h in empty]
+            )
+            sem = old_sem
+
         await browser.close()
 
     return results
@@ -374,6 +510,10 @@ async def _scrape_all_async(handles: list[str]) -> dict[str, list[dict]]:
 def fetch_infinite_options(handles: list[str]) -> dict[str, list[dict]]:
     """Synchronous wrapper around the async Playwright scraper."""
     print(f"\nScraping Infinite Options from {len(handles)} product page(s) ...")
+    print(
+        f"  wait={IO_GOTO_WAIT}, timeout={IO_WAIT_TIMEOUT_MS}ms, "
+        f"retries={IO_SCRAPE_RETRIES}, concurrency={IO_CONCURRENCY}"
+    )
     return asyncio.run(_scrape_all_async(handles))
 
 

@@ -110,7 +110,11 @@ EXPORT_CSV_FILE=true              # Write a local CSV file (set false on Railway
 
 # ── Infinite Options scraping ──────────────────────────────────────────────
 SCRAPE_INFINITE_OPTIONS=true      # Scrape IO option groups via headless Chromium
-IO_CONCURRENCY=5                  # Parallel browser pages (increase to speed up)
+IO_CONCURRENCY=5                  # Parallel browser pages (lower if options are often empty)
+IO_WAIT_TIMEOUT_MS=30000          # Max wait for Infinite Options widget to render
+IO_SCRAPE_RETRIES=3               # Page load attempts per product before giving up
+IO_POLL_INTERVAL_MS=500           # Poll interval while waiting for options
+IO_GOTO_WAIT=load                 # Page load event: load | domcontentloaded | networkidle
 MAX_PRODUCT_IMAGES=50             # Max image columns per product (default 50)
 ```
 
@@ -187,4 +191,8 @@ Set all environment variables listed above in Railway's **Variables** tab. Do **
 | `SHOPIFY_API_VERSION` | `2026-01` | Shopify API version |
 | `SCRAPE_INFINITE_OPTIONS` | `true` | Scrape Infinite Options via headless Chromium |
 | `IO_CONCURRENCY` | `5` | Number of parallel browser pages for scraping |
+| `IO_WAIT_TIMEOUT_MS` | `30000` | Max wait for Infinite Options to render (ms) |
+| `IO_SCRAPE_RETRIES` | `3` | Load attempts per product page |
+| `IO_POLL_INTERVAL_MS` | `500` | Poll interval while waiting for options (ms) |
+| `IO_GOTO_WAIT` | `load` | Playwright `wait_until` for product pages |
 | `MAX_PRODUCT_IMAGES` | `50` | Maximum image URL columns per product |
