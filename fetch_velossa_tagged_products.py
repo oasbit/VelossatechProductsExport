@@ -77,6 +77,7 @@ SHEETS_CREDENTIALS_FILE = os.environ.get("SHEETS_CREDENTIALS_FILE", "service-acc
 SCRAPE_INFINITE_OPTIONS = os.environ.get("SCRAPE_INFINITE_OPTIONS", "true").lower() == "true"
 IO_CONCURRENCY          = int(os.environ.get("IO_CONCURRENCY", "5"))
 MAX_IO_OPTIONS          = 5   # Maximum number of option groups to export as columns
+MAX_PRODUCT_IMAGES      = int(os.environ.get("MAX_PRODUCT_IMAGES", "50"))  # Cap image columns per product
 
 # -- Shopify Admin API (optional) -------------------------------------------
 # When set, uses the Admin API to get ALL variants and ALL products (including
@@ -398,33 +399,38 @@ def _normalize_image_url(src: str | None) -> str:
     return s
 
 
-def _image_url_for_variant(product: dict, variant: dict) -> str:
+def _all_product_image_urls(product: dict) -> list[str]:
     """
-    Prefer the variant's own image when Shopify provides one; otherwise the
-    product's featured / first image. Works with Admin API and storefront JSON.
+    All product image URLs in Shopify order (Admin API / storefront images array).
+    Deduplicated while preserving order. Falls back to the single featured image.
     """
-    v = variant
-    p = product
+    urls: list[str] = []
+    seen: set[str] = set()
 
-    fi = v.get("featured_image")
-    if isinstance(fi, dict) and fi.get("src"):
-        return _normalize_image_url(fi["src"])
+    for img in product.get("images") or []:
+        if not isinstance(img, dict):
+            continue
+        u = _normalize_image_url(img.get("src"))
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
 
-    vid = v.get("image_id")
-    if vid:
-        for img in p.get("images") or []:
-            if isinstance(img, dict) and img.get("id") == vid:
-                return _normalize_image_url(img.get("src"))
+    if not urls:
+        feat = product.get("image")
+        if isinstance(feat, dict):
+            u = _normalize_image_url(feat.get("src"))
+            if u:
+                urls.append(u)
 
-    feat = p.get("image")
-    if isinstance(feat, dict) and feat.get("src"):
-        return _normalize_image_url(feat["src"])
+    return urls[:MAX_PRODUCT_IMAGES]
 
-    imgs = p.get("images") or []
-    if imgs and isinstance(imgs[0], dict):
-        return _normalize_image_url(imgs[0].get("src"))
 
-    return ""
+def _image_columns(urls: list[str], num_columns: int) -> dict[str, str]:
+    """Map Image URL 1..N columns for a product's image list."""
+    return {
+        f"Image URL {i}": urls[i - 1] if i <= len(urls) else ""
+        for i in range(1, num_columns + 1)
+    }
 
 
 def _product_description(product: dict) -> str:
@@ -435,17 +441,16 @@ def _product_description(product: dict) -> str:
 def filter_and_shape(
     raw_products: list[dict],
     io_options: dict[str, list[dict]] | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """
     Keep only products that have at least one TARGET_TAG.
-    Returns one flat dict per variant (one row per variant in the output).
+    Returns (rows, max_image_columns) — one flat dict per variant.
     io_options — optional dict {handle: [{name, values}, ...]} from the scraper.
     """
-    results: list[dict] = []
+    staged: list[tuple[dict, list[str], list[str], dict[str, str]]] = []
 
     for p in raw_products:
         raw_tags = p.get("tags", [])
-        # Public endpoint returns tags as a list; guard against unexpected string format
         if isinstance(raw_tags, str):
             raw_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
 
@@ -456,14 +461,19 @@ def filter_and_shape(
             continue
 
         handle = p["handle"]
-
-        # Build Infinite Options columns (up to MAX_IO_OPTIONS groups)
         io_cols: dict[str, str] = {}
         if io_options is not None:
             for i, opt in enumerate(io_options.get(handle, [])[:MAX_IO_OPTIONS], start=1):
                 io_cols[f"IO Option {i} Name"]   = opt["name"]
                 io_cols[f"IO Option {i} Values"] = ", ".join(opt["values"])
 
+        staged.append((p, matched, _all_product_image_urls(p), io_cols))
+
+    max_images = max((len(urls) for _, _, urls, _ in staged), default=0)
+
+    results: list[dict] = []
+    for p, matched, image_urls, io_cols in staged:
+        handle = p["handle"]
         product_base = {
             "Product ID":    p["id"],
             "Title":         p["title"],
@@ -474,13 +484,13 @@ def filter_and_shape(
             "Description":   _product_description(p),
             "Created At":    p.get("created_at", ""),
             "Updated At":    p.get("updated_at", ""),
+            **_image_columns(image_urls, max_images),
             **io_cols,
         }
 
         for v in p.get("variants", []):
             results.append({
                 **product_base,
-                "Image URL":        _image_url_for_variant(p, v),
                 "Variant ID":       v["id"],
                 "Variant Title":    v.get("title", ""),
                 "Price":            v.get("price", ""),
@@ -489,7 +499,7 @@ def filter_and_shape(
                 "Available":        v.get("available", ""),
             })
 
-    return results
+    return results, max_images
 
 
 # ---------------------------------------------------------------------------
@@ -498,37 +508,40 @@ def filter_and_shape(
 
 _IO_COLUMNS = [col for i in range(1, MAX_IO_OPTIONS + 1) for col in (f"IO Option {i} Name", f"IO Option {i} Values")]
 
-FIELDNAMES = [
-    "Product ID",
-    "Title",
-    "Handle",
-    "Product Type",
-    "Matched Tags",
-    "Product URL",
-    "Description",
-    "Image URL",
-    *_IO_COLUMNS,
-    "Variant ID",
-    "Variant Title",
-    "Price",
-    "Compare At Price",
-    "SKU",
-    "Available",
-    "Created At",
-    "Updated At",
-]
+
+def build_fieldnames(num_images: int) -> list[str]:
+    image_cols = [f"Image URL {i}" for i in range(1, num_images + 1)]
+    return [
+        "Product ID",
+        "Title",
+        "Handle",
+        "Product Type",
+        "Matched Tags",
+        "Product URL",
+        "Description",
+        *image_cols,
+        *_IO_COLUMNS,
+        "Variant ID",
+        "Variant Title",
+        "Price",
+        "Compare At Price",
+        "SKU",
+        "Available",
+        "Created At",
+        "Updated At",
+    ]
 
 
-def export_csv(products: list[dict]) -> None:
+def export_csv(products: list[dict], fieldnames: list[str]) -> None:
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows({f: p.get(f, "") for f in FIELDNAMES} for p in products)
+        writer.writerows({f: p.get(f, "") for f in fieldnames} for p in products)
 
     print(f"Exported {len(products)} product(s) → {OUTPUT_CSV}")
 
 
-def export_to_sheets(products: list[dict]) -> None:
+def export_to_sheets(products: list[dict], fieldnames: list[str]) -> None:
     """
     Write the product list to a Google Sheet, replacing all existing content.
 
@@ -575,7 +588,7 @@ def export_to_sheets(products: list[dict]) -> None:
     worksheet   = spreadsheet.get_worksheet(0)
 
     # Build rows: header first, then one row per product (missing keys default to "")
-    rows = [FIELDNAMES] + [[str(p.get(field, "")) for field in FIELDNAMES] for p in products]
+    rows = [fieldnames] + [[str(p.get(field, "")) for field in fieldnames] for p in products]
 
     worksheet.clear()
     worksheet.update(rows, value_input_option=ValueInputOption.user_entered)
@@ -612,11 +625,15 @@ def main() -> None:
         with_options = sum(1 for v in io_options.values() if v)
         print(f"  {with_options}/{len(handles)} products have Infinite Options")
 
-    matched = filter_and_shape(raw, io_options)
+    matched, num_images = filter_and_shape(raw, io_options)
+    fieldnames = build_fieldnames(num_images)
 
     if not matched:
         print("No products found matching the specified tags.")
         return
+
+    if num_images:
+        print(f"Image columns            : {num_images} (Image URL 1 … Image URL {num_images})")
 
     # Per-tag breakdown — count unique products (not variant rows)
     tag_products: dict[str, set] = {}
@@ -636,10 +653,10 @@ def main() -> None:
 
     print()
     if EXPORT_CSV_FILE:
-        export_csv(matched)
+        export_csv(matched, fieldnames)
 
     if EXPORT_TO_SHEETS:
-        export_to_sheets(matched)
+        export_to_sheets(matched, fieldnames)
 
 
 if __name__ == "__main__":
