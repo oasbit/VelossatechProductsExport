@@ -1,5 +1,7 @@
 service-account.json
 .velossa_admin_token
+.shopify_app.json
+get_offline_token.py
 *.csv
 __pycache__/
 .env

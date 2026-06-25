@@ -1,46 +1,105 @@
 # Velossatech Products Export
 
-Fetches all active products from [Velossa Tech Design](https://www.velossatechdesign.com/) that contain at least one of the defined customization/option tags, scrapes their [Infinite Options](https://www.shoppad.co/infinite-options/) option groups via headless Chromium, and exports everything to a **CSV file** and/or a **Google Sheet**.
+Exports the full [Velossa Tech Design](https://www.velossatechdesign.com/) catalog
+— **every product and every native Shopify variant, with prices** — to a **Google
+Sheet** (and optionally a local CSV). One row per variant, exactly like a normal
+Shopify store export.
+
+> **Migration note:** Velossa Tech has moved off the Infinite Options app to
+> native Shopify variants. This exporter therefore reads variants directly from
+> the Shopify Admin API. There is **no more page scraping / headless browser** —
+> the previous Infinite Options Playwright scraper has been retired.
+
+---
+
+## How it works
+
+1. Connects to the **Shopify GraphQL Admin API** using `SHOPIFY_ADMIN_TOKEN`.
+2. Pages through every product and resolves the **complete** variant list for
+   each one (paginating past 100/250 where needed). This matters because several
+   migrated products now have hundreds — and some over a thousand — native
+   variants (body colour × flare colour × flare shape).
+3. Flattens to **one row per variant** with native option columns, price,
+   compare-at price, SKU, availability and inventory.
+4. Writes the result to the target Google Sheet in batches (and/or a CSV).
+
+The public `/products.json` storefront endpoint is intentionally **not** used as
+the data source because it caps variants at **250 per product** and would silently
+truncate the high-variant products. This store has **43 products above 250
+variants** (the largest has **1,700**), so storefront mode would drop real data.
+The Admin API path paginates variants per product, so nothing is lost.
+
+---
+
+## Authentication
+
+Legacy "custom apps" created in the store admin (which exposed a permanent
+`shpat_` token) were **deprecated on 2026-01-01** and can no longer be created.
+New apps are built in the **Dev Dashboard** and expose only a Client ID + Client
+Secret. There are two ways to turn those into an Admin API token:
+
+- **Client credentials grant** — simplest, but only works when the app **and**
+  store are in the **same Shopify organization**. An agency app installed on a
+  client's production store returns `shop_not_permitted`. The script will use this
+  automatically if `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET` are set and the
+  store is in the same org.
+- **Authorization code grant** — works **across organizations** and yields a
+  **permanent** offline token (`shpca_…`/`shpat_…`, valid until the app is
+  uninstalled). Use the included helper `get_offline_token.py` once to mint it.
+
+### Mint a permanent token with `get_offline_token.py`
+
+1. In the Dev Dashboard app: enable **"Use legacy install flow"**, add the
+   Redirect URL `http://localhost:3456/callback`, set scopes
+   `read_products, read_inventory`, and **Release** a version.
+2. Put the app's Client ID/Secret in a git-ignored `.shopify_app.json`
+   (`{"client_id": "...", "client_secret": "..."}`) or env vars.
+3. Run:
+
+```bash
+SHOPIFY_STORE=velossatech.myshopify.com python3 get_offline_token.py
+```
+
+4. Open the printed authorize URL in a browser logged into the store admin and
+   approve. The helper captures the code, exchanges it, and writes the token to
+   `.velossa_admin_token`.
+
+Set that token as `SHOPIFY_ADMIN_TOKEN` on Railway. It does not expire, so no
+refresh logic is needed.
 
 ---
 
 ## Requirements
 
 - Python 3.9+
-- Install Python dependencies:
+- Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-- Install the Playwright Chromium browser (needed for Infinite Options scraping):
-
-```bash
-playwright install chromium
-```
+No browser/Playwright is required.
 
 ---
 
 ## Usage
 
-### Run locally (CSV + Google Sheets)
-
 ```bash
-python3 fetch_velossa_tagged_products.py
+# Full export to Google Sheets (+ local CSV)
+SHOPIFY_ADMIN_TOKEN=shpca_xxx python3 export_shopify_products.py
+
+# CSV only (no Sheets), handy for local testing
+EXPORT_TO_SHEETS=false python3 export_shopify_products.py
+
+# Dry run: just the first N products to a CSV
+MAX_PRODUCTS=4 EXPORT_TO_SHEETS=false OUTPUT_CSV=dry-run.csv python3 export_shopify_products.py
 ```
 
-Output file: `Velossa-Tagged-Products.csv`
+Local CSV output: `Velossa-Products.csv`
 
-The script auto-selects the data source:
-
-- **Admin API** — used when `SHOPIFY_ADMIN_TOKEN` is set. Returns all products and all variants.
-- **Storefront API** — public fallback, no credentials needed. May cap variants per product.
-
-### Disable Infinite Options scraping (faster, for testing)
-
-```bash
-SCRAPE_INFINITE_OPTIONS=false python3 fetch_velossa_tagged_products.py
-```
+The Admin token can also be placed in a local file named `.velossa_admin_token`
+(git-ignored) instead of the environment variable — this is what
+`get_offline_token.py` writes. See **Authentication** above to obtain a token.
 
 ---
 
@@ -48,74 +107,41 @@ SCRAPE_INFINITE_OPTIONS=false python3 fetch_velossa_tagged_products.py
 
 One-time setup per Google Cloud project.
 
-### 1. Create a Google Cloud project
-
-Go to [console.cloud.google.com](https://console.cloud.google.com/) and create a new project (or use an existing one).
-
-### 2. Enable the Google Sheets API
-
-- In the Cloud Console, navigate to **APIs & Services > Library**.
-- Search for **Google Sheets API** and click **Enable**.
-
-### 3. Create a Service Account
-
-- Navigate to **APIs & Services > Credentials**.
-- Click **Create Credentials > Service Account**.
-- Give it any name (e.g. `velossa-exporter`) and click **Done**.
-
-### 4. Download the JSON key
-
-- Click the service account you just created.
-- Go to the **Keys** tab > **Add Key > Create new key > JSON**.
-- Save the downloaded file as `service-account.json` in this project folder.
-
-> Keep this file private — it grants write access to any Sheet you share with it.
-> It is in `.gitignore` so it will not be committed.
-
-### 5. Share the Google Sheet with the service account
-
-- Open your target Google Sheet.
-- Click **Share** and add the service account email (found in `service-account.json` under `"client_email"`).
-- Grant it **Editor** access.
-
-### 6. Get the Spreadsheet ID
-
-Copy the ID from the Sheet URL:
-
-```
-https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
-```
-
-Set it as the `SHEETS_SPREADSHEET_ID` environment variable (see `.env` below).
+1. **Create a Google Cloud project** at [console.cloud.google.com](https://console.cloud.google.com/).
+2. **Enable the Google Sheets API** under *APIs & Services > Library*.
+3. **Create a Service Account** under *APIs & Services > Credentials*.
+4. **Download a JSON key** (*Keys > Add Key > Create new key > JSON*) and save it
+   as `service-account.json` in this folder (git-ignored).
+5. **Share the target Google Sheet** with the service account email
+   (`client_email` in the JSON) as **Editor**.
+6. **Copy the Spreadsheet ID** from the Sheet URL
+   (`https://docs.google.com/spreadsheets/d/<ID>/edit`) into `SHEETS_SPREADSHEET_ID`.
 
 ---
 
 ## Environment Variables
 
-Copy the following into a `.env` file for local runs, or set them directly in Railway.
-
 ```bash
 # ── Shopify Admin API ──────────────────────────────────────────────────────
-SHOPIFY_ADMIN_TOKEN=              # Shopify Admin API access token
+SHOPIFY_ADMIN_TOKEN=              # required: Admin API access token (shpat_...)
 SHOPIFY_STORE=velossatech.myshopify.com
+SHOPIFY_API_VERSION=2026-01
+STORE_PUBLIC_URL=https://www.velossatechdesign.com
 
 # ── Google Sheets ──────────────────────────────────────────────────────────
-GOOGLE_SERVICE_ACCOUNT_JSON=      # Full JSON content of service-account.json (one line, for Railway)
-SHEETS_SPREADSHEET_ID=            # From the Sheet URL: .../d/<ID>/edit
-SHEETS_CREDENTIALS_FILE=service-account.json   # Path to key file (local only)
+GOOGLE_SERVICE_ACCOUNT_JSON=      # full JSON content of service-account.json (Railway)
+SHEETS_SPREADSHEET_ID=1iV4e3nwf2kMAx2G7LZkxSyCopXxc867Jm4J7rvVcVUE
+SHEETS_CREDENTIALS_FILE=service-account.json   # local key file path
+SHEETS_WORKSHEET=0                # worksheet tab index or title
 
 # ── Export behaviour ───────────────────────────────────────────────────────
-EXPORT_TO_SHEETS=true             # Enable Google Sheets export
-EXPORT_CSV_FILE=true              # Write a local CSV file (set false on Railway)
-
-# ── Infinite Options scraping ──────────────────────────────────────────────
-SCRAPE_INFINITE_OPTIONS=true      # Scrape IO option groups via headless Chromium
-IO_CONCURRENCY=5                  # Parallel browser pages (lower if options are often empty)
-IO_WAIT_TIMEOUT_MS=30000          # Max wait for Infinite Options widget to render
-IO_SCRAPE_RETRIES=3               # Page load attempts per product before giving up
-IO_POLL_INTERVAL_MS=500           # Poll interval while waiting for options
-IO_GOTO_WAIT=load                 # Page load event: load | domcontentloaded | networkidle
-MAX_PRODUCT_IMAGES=50             # Max image columns per product (default 50)
+EXPORT_TO_SHEETS=true
+EXPORT_CSV_FILE=true              # set false on Railway (no persistent filesystem)
+OUTPUT_CSV=Velossa-Products.csv
+PRODUCT_STATUS=active             # active | archived | draft | any
+FILTER_TAGS=                      # optional comma-separated tag allow-list (empty = all products)
+MAX_PRODUCT_IMAGES=13             # gallery image columns per product
+MAX_PRODUCTS=0                    # stop after N products (0 = all); set e.g. 5 for a dry run
 ```
 
 ---
@@ -124,53 +150,44 @@ MAX_PRODUCT_IMAGES=50             # Max image columns per product (default 50)
 
 | Column | Description |
 |---|---|
-| Product ID | Shopify internal product ID |
+| Product ID | Shopify product ID (numeric) |
+| Handle | URL slug |
 | Title | Product title |
-| Handle | URL-friendly product slug |
+| Vendor | Product vendor |
 | Product Type | Shopify product type |
-| Matched Tags | Customization tags found on the product |
-| Product URL | Direct link to the product page |
-| Description | Product description as plain text (HTML stripped from `body_html`) |
-| Image URL 1 … Image URL N | All product images from Shopify, one URL per column (N = max images among exported products, capped by `MAX_PRODUCT_IMAGES`) |
-| IO Option 1 Name | First Infinite Options group name (e.g. "Body/Snorkel Color") |
-| IO Option 1 Values | Comma-separated list of values for option group 1 |
-| IO Option 2 Name | Second Infinite Options group name |
-| IO Option 2 Values | Comma-separated list of values for option group 2 |
-| IO Option 3–5 Name/Values | Additional option groups (up to 5 total) |
-| Variant ID | Shopify variant ID |
-| Variant Title | Variant title (usually "Default Title" for IO-managed products) |
+| Status | active / archived / draft |
+| Tags | Comma-separated product tags |
+| Product URL | Storefront product link |
+| Description | Description as plain text, HTML stripped (populated on each product's first variant row only, Shopify-CSV style) |
+| Option1 Name / Value | First native option (e.g. "Body/Snorkel Color" → "Red") |
+| Option2 Name / Value | Second native option |
+| Option3 Name / Value | Third native option |
+| Variant ID | Shopify variant ID (numeric) |
+| Variant SKU | Variant SKU |
 | Price | Variant price |
 | Compare At Price | Original price before discount |
-| SKU | Variant SKU |
-| Available | Whether the variant is in stock |
-| Created At | ISO 8601 creation timestamp |
-| Updated At | ISO 8601 last-updated timestamp |
-
----
-
-## Target Tags
-
-The following customization/option tags are used to filter products:
-
-`flarecolor`, `bodycolor`, `makemodel`, `universal`, `subarumodel`, `f150year`, `focusyear`, `musbumper`, `musconfig`, `grilletype`, `musgrille`, `musresonator`, `brakecool`, `keycolor`, `fusionlower`, `fusionpedal`, `pedalinlay`, `pedalbackground`, `winglift`, `plugcolor`, `fincolor`, `elantratrans`, `g70trim`, `canistercolor`, `bigconfig`, `suvbigconfig`, `halo`
-
-To add or remove tags, edit the `TARGET_TAGS` set in the script.
+| Available | Whether the variant is purchasable |
+| Inventory Qty | Tracked inventory quantity |
+| Variant Image | Variant-specific image URL (if any) |
+| Image URL 1 … N | Product gallery images (populated on each product's first variant row, Shopify-CSV style) |
+| Created At / Updated At | ISO 8601 timestamps |
 
 ---
 
 ## Railway Deployment
 
-The project includes a `Dockerfile` that bakes Python, Playwright, and the Chromium browser into the image. Railway automatically detects and uses it.
-
-The `railway.toml` schedules the script to run daily at 08:00 UTC:
+`railway.toml` runs the exporter daily at 08:00 UTC:
 
 ```toml
 [deploy]
-startCommand = "python3 fetch_velossa_tagged_products.py"
+startCommand = "python3 export_shopify_products.py"
 cronSchedule = "0 8 * * *"
 ```
 
-Set all environment variables listed above in Railway's **Variables** tab. Do **not** set `EXPORT_CSV_FILE=true` on Railway (no persistent filesystem). Use `GOOGLE_SERVICE_ACCOUNT_JSON` instead of `SHEETS_CREDENTIALS_FILE` to pass the service account credentials as a single environment variable.
+The slim `Dockerfile` installs only the Python dependencies — no Chromium.
+
+Set the environment variables above in Railway's **Variables** tab. On Railway,
+use `GOOGLE_SERVICE_ACCOUNT_JSON` (not a key file) and set `EXPORT_CSV_FILE=false`.
 
 ---
 
@@ -178,21 +195,21 @@ Set all environment variables listed above in Railway's **Variables** tab. Do **
 
 | Variable | Default | Description |
 |---|---|---|
-| `STORE_URL` | `https://www.velossatechdesign.com` | Shopify store base URL |
-| `OUTPUT_CSV` | `Velossa-Tagged-Products.csv` | Output CSV file name |
-| `PAGE_SIZE` | `250` | Products per API page (max 250) |
-| `EXPORT_TO_SHEETS` | `true` | Enable Google Sheets export |
-| `EXPORT_CSV_FILE` | `true` | Write a local CSV file |
-| `SHEETS_CREDENTIALS_FILE` | `service-account.json` | Path to service account key file |
-| `SHEETS_SPREADSHEET_ID` | — | Target Google Spreadsheet ID |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | — | Full service account JSON string (Railway) |
-| `SHOPIFY_ADMIN_TOKEN` | — | Shopify Admin API access token |
+| `SHOPIFY_ADMIN_TOKEN` | — | **Required.** Admin API access token |
 | `SHOPIFY_STORE` | `velossatech.myshopify.com` | Myshopify domain |
-| `SHOPIFY_API_VERSION` | `2026-01` | Shopify API version |
-| `SCRAPE_INFINITE_OPTIONS` | `true` | Scrape Infinite Options via headless Chromium |
-| `IO_CONCURRENCY` | `5` | Number of parallel browser pages for scraping |
-| `IO_WAIT_TIMEOUT_MS` | `30000` | Max wait for Infinite Options to render (ms) |
-| `IO_SCRAPE_RETRIES` | `3` | Load attempts per product page |
-| `IO_POLL_INTERVAL_MS` | `500` | Poll interval while waiting for options (ms) |
-| `IO_GOTO_WAIT` | `load` | Playwright `wait_until` for product pages |
-| `MAX_PRODUCT_IMAGES` | `50` | Maximum image URL columns per product |
+| `SHOPIFY_API_VERSION` | `2026-01` | Admin API version |
+| `STORE_PUBLIC_URL` | `https://www.velossatechdesign.com` | Storefront base for Product URL fallback |
+| `EXPORT_TO_SHEETS` | `true` | Write to Google Sheets |
+| `EXPORT_CSV_FILE` | `true` | Write a local CSV |
+| `OUTPUT_CSV` | `Velossa-Products.csv` | CSV file name |
+| `SHEETS_SPREADSHEET_ID` | (target sheet) | Google Spreadsheet ID |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | — | Service account JSON (Railway) |
+| `SHEETS_CREDENTIALS_FILE` | `service-account.json` | Local key file path |
+| `SHEETS_WORKSHEET` | `0` | Worksheet tab index or title |
+| `PRODUCT_STATUS` | `active` | Product status filter |
+| `FILTER_TAGS` | — | Optional tag allow-list (empty = all products) |
+| `MAX_PRODUCT_IMAGES` | `13` | Gallery image columns per product |
+| `MAX_PRODUCTS` | `0` | Stop after N products (0 = all); use for dry runs |
+| `PRODUCTS_PER_PAGE` | `25` | Products per GraphQL page |
+| `VARIANTS_PER_PAGE` | `100` | Variants per GraphQL page |
+| `SHEETS_BATCH_ROWS` | `2000` | Rows per Sheets write request |
