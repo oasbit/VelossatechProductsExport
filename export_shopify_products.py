@@ -266,7 +266,6 @@ _VARIANT_FIELDS = """
   price
   compareAtPrice
   availableForSale
-  inventoryQuantity
   selectedOptions { name value }
   image { url }
 """
@@ -483,7 +482,6 @@ def shape_rows(products: list[dict]) -> tuple[list[dict], int]:
                 "Price": v.get("price", ""),
                 "Compare At Price": v.get("compareAtPrice") or "",
                 "Available": v.get("availableForSale", ""),
-                "Inventory Qty": v.get("inventoryQuantity", ""),
                 "Variant Image": (v.get("image") or {}).get("url", "") or "",
                 **gallery_cols,
             })
@@ -514,7 +512,6 @@ def build_fieldnames(num_images: int) -> list[str]:
         "Price",
         "Compare At Price",
         "Available",
-        "Inventory Qty",
         "Variant Image",
         *image_cols,
         "Created At",

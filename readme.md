@@ -20,7 +20,7 @@ Shopify store export.
    migrated products now have hundreds — and some over a thousand — native
    variants (body colour × flare colour × flare shape).
 3. Flattens to **one row per variant** with native option columns, price,
-   compare-at price, SKU, availability and inventory.
+   compare-at price, SKU and availability.
 4. Writes the result to the target Google Sheet in batches (and/or a CSV).
 
 The public `/products.json` storefront endpoint is intentionally **not** used as
@@ -167,7 +167,6 @@ MAX_PRODUCTS=0                    # stop after N products (0 = all); set e.g. 5 
 | Price | Variant price |
 | Compare At Price | Original price before discount |
 | Available | Whether the variant is purchasable |
-| Inventory Qty | Tracked inventory quantity |
 | Variant Image | Variant-specific image URL (if any) |
 | Image URL 1 … N | Product gallery images (populated on each product's first variant row, Shopify-CSV style) |
 | Created At / Updated At | ISO 8601 timestamps |
